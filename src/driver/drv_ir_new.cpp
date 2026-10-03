@@ -177,7 +177,11 @@ SpoofIrReceiver IrReceiver;
 // we simply note the numbers into a rolling buffer, assume the first is a mark()
 // and then every 50us service the rolling buffer, changing the PWM from 0 duty to 50% duty
 // appropriately.
-#define SEND_MAXBITS 128
+// A/C frames are long: Samsung AC (21 bytes) is about 350 marks/spaces,
+// Mitsubishi AC (18 bytes, sent twice) about 580. 512 bits = 1024 entries.
+// (drv_ir.h keeps 128 for the Arduino-IRremote driver.)
+#undef SEND_MAXBITS
+#define SEND_MAXBITS 512
 
 class myIRsend : public IRsend {
 public:
@@ -251,7 +255,7 @@ public:
 		currentbitval = 0;
 		timecounttotal = 0;
 	}
-	int32_t times[SEND_MAXBITS * 2]; // enough for 128 bits
+	int32_t times[SEND_MAXBITS * 2]; // enough for 512 bits
 	unsigned short timein;
 	unsigned short timeout;
 	unsigned short timecount;
@@ -357,9 +361,45 @@ extern "C" void DRV_IR_ISR(void* arg)
 }
 
 
+// Sends a protocol whose message is a byte array, as A/C units use
+// (SAMSUNG_AC, MITSUBISHI_AC, DAIKIN, FUJITSU_AC, ...). hex is the state,
+// two hex digits per byte, optionally prefixed with 0x.
+static commandResult_t IR_Send_State(const char *name, decode_type_t protocol, uint16_t bits, const char *hex) {
+	uint8_t state[64];
+	uint16_t nbytes = (bits + 7) / 8;
+	if (protocol == decode_type_t::UNKNOWN || nbytes == 0 || nbytes > sizeof(state)) {
+		ADDLOG_ERROR(LOG_FEATURE_IR, (char *)"IRSend %s: unknown protocol or bad size (%d bits)", name, (int)bits);
+		return CMD_RES_BAD_ARGUMENT;
+	}
+	if (hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) {
+		hex += 2;
+	}
+	for (uint16_t i = 0; i < nbytes; i++) {
+		char byte[3] = { hex[0], hex[0] ? hex[1] : (char)0, 0 };
+		char *end;
+		state[i] = (uint8_t)strtoul(byte, &end, 16);
+		if (end != byte + 2) {
+			ADDLOG_ERROR(LOG_FEATURE_IR, (char *)"IRSend %s: expected %d bytes of hex data", name, (int)nbytes);
+			return CMD_RES_BAD_ARGUMENT;
+		}
+		hex += 2;
+	}
+	if (!pIRsend) {
+		ADDLOG_INFO(LOG_FEATURE_IR, (char *)"IR NOT send (no IRsend running) %s", name);
+		return CMD_RES_ERROR;
+	}
+	if (!pIRsend->send(protocol, state, nbytes)) {
+		ADDLOG_ERROR(LOG_FEATURE_IR, (char *)"IR can't send %s: protocol %d, %d bytes", name, (int)protocol, (int)nbytes);
+		return CMD_RES_BAD_ARGUMENT;
+	}
+	pIRsend->delay(100);
+	ADDLOG_INFO(LOG_FEATURE_IR, (char *)"IR send %s: protocol %d bits %d (%d bytes)", name, (int)protocol, (int)bits, (int)nbytes);
+	return CMD_RES_OK;
+}
+
 extern "C" commandResult_t IR_Send_Cmd(const void *context, const char *cmd, const char *args_in, int cmdFlags) {
 	if (!args_in) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
-	char args[128];
+	char args[256];
 	strncpy(args, args_in, sizeof(args) - 1);
 	args[sizeof(args) - 1] = 0;
 
@@ -390,7 +430,7 @@ extern "C" commandResult_t IR_Send_Cmd(const void *context, const char *cmd, con
 				*p='\0';
 				uint16_t bits = (uint16_t)strtol(_bits,NULL,10);
 				p++;
-				if(bits<=64)
+				if(!hasACState(protocol) && bits<=64)
 				{
 					char *_data=p;
 					uint64_t data =  strtoll(_data,&p,16);
@@ -411,9 +451,9 @@ extern "C" commandResult_t IR_Send_Cmd(const void *context, const char *cmd, con
 						}
 					}
 				} else {
-					// TODO: implement longer protocols
-					ADDLOG_ERROR(LOG_FEATURE_IR, (char *)"IRSend currently only protocol with up to 64bits are supported", args);
-					return CMD_RES_BAD_ARGUMENT;
+					// A/C units and other protocols longer than 64 bits: the data is
+					// the whole state as hex bytes, e.g. SAMSUNG_AC,112,0x02920F00...
+					return IR_Send_State(args, protocol, bits, p);
 				}
 			} 
 		}
@@ -702,8 +742,8 @@ extern "C" void DRV_IR_Init() {
 
 			pIRsend = pIRsendTemp;
 
-			//cmddetail:{"name":"IRSend","args":"[PROT-ADDR-CMD-REP]",
-			//cmddetail:"descr":"Sends IR commands in the form PROT-ADDR-CMD-REP, e.g. NEC-1-1A-0",
+			//cmddetail:{"name":"IRSend","args":"[PROT-ADDR-CMD-REP] or [PROT,BITS,0xDATA[,REP]]",
+			//cmddetail:"descr":"Sends IR commands in the form PROT-ADDR-CMD-REP, e.g. NEC-1-1A-0, or PROT,BITS,0xDATA[,REP], e.g. NEC,32,0x20DF10EF. For A/C protocols and anything longer than 64 bits DATA is the whole state in hex bytes, e.g. SAMSUNG_AC,112,0x02920F000000F001C2FE715019F0 or MITSUBISHI_AC,144,0x23CB260100201805364200000000000000CA",
 			//cmddetail:"fn":"IR_Send_Cmd","file":"driver/drv_ir_new.cpp","requires":"ENABLE_DRIVER_IRREMOTEESP (IRremoteESP8266)",
 			//cmddetail:"examples":""}
 			CMD_RegisterCommand("IRSend", IR_Send_Cmd, NULL);
