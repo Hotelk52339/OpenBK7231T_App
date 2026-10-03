@@ -292,7 +292,7 @@ public:
 	volatile uint8_t precise;
 
 	bool busy() {
-		return timein != timeout || currentsendtime != 0;
+		return timein != timeout || currentsendtime != 0 || precise;
 	}
 
 	uint32_t our_ms;
@@ -416,6 +416,11 @@ extern "C" long xTaskResumeAll(void);
 // IREnable precise 0/1: send A/C states with IR_SendQueuedPrecise() (default)
 // or from the 50 us timer interrupt.
 static uint8_t gIRPreciseSend = 1;
+// IREnable framelock 0/1: keep interrupts off from the first to the last edge
+// of a frame (default), as ESPHome's remote_transmitter and Tuya's own BK7231N
+// IR driver do; 0 lets interrupts in during spaces and other tasks run in the
+// long ones.
+static uint8_t gIRFrameLock = 1;
 
 #if IR_PRECISE_SEND
 static uint32_t IR_TicksSince(uint32_t from, uint32_t wrap) {
@@ -425,9 +430,10 @@ static uint32_t IR_TicksSince(uint32_t from, uint32_t wrap) {
 
 // Sends the queued frame from the calling task, timing every mark and space on
 // the free-running 26 MHz calibration timer instead of counting 50 us timer
-// interrupts, which any longer interrupt (Wi-Fi) stretches or delays. Marks and
-// the last IR_PRECISE_GUARD_US of every space run with interrupts off, so an
-// edge is never late; the rest of a space lets interrupts in, and long gaps let
+// interrupts, which any longer interrupt (Wi-Fi) stretches or delays. With
+// gIRFrameLock (default) interrupts stay off from the first to the last edge;
+// otherwise marks and the last IR_PRECISE_GUARD_US of every space run with
+// interrupts off, the rest of a space lets interrupts in, and long spaces let
 // other tasks run. Trailing spaces only keep the LED dark for their length.
 // Returns the largest delay of an edge in microseconds.
 static uint32_t IR_SendQueuedPrecise() {
@@ -466,7 +472,7 @@ static uint32_t IR_SendQueuedPrecise() {
 			HAL_PIN_PWM_Update(pIRsend->sendPin, duty);
 		}
 		uint32_t len = us * IR_TICKS_PER_US;
-		if (!mark && us > IR_PRECISE_GUARD_US) {
+		if (!gIRFrameLock && !mark && us > IR_PRECISE_GUARD_US) {
 			uint32_t open = (us - IR_PRECISE_GUARD_US) * IR_TICKS_PER_US;
 			GLOBAL_INT_RESTORE();
 			if (us >= IR_PRECISE_SLEEP_FROM_US) {
@@ -495,10 +501,11 @@ static uint32_t IR_SendQueuedPrecise() {
 	GLOBAL_INT_RESTORE();
 	xTaskResumeAll();
 	pIRsend->lastduty = idleDuty;
-	pIRsend->precise = 0;
 	if (trailingUs >= 1000) {
 		rtos_delay_milliseconds(trailingUs / 1000);
 	}
+	// only now: busy() keeps the next frame out of the trailing gap
+	pIRsend->precise = 0;
 	return maxLate / IR_TICKS_PER_US;
 }
 #endif
@@ -733,6 +740,19 @@ extern "C" commandResult_t IR_Enable(const void *context, const char *cmd, const
 		return CMD_RES_OK;
 	}
 
+	if (!my_strnicmp(p, "framelock", 9)) {
+		p += 9;
+		if (*p == ' ') {
+			p++;
+			if (*p) {
+				enable = atoi(p);
+			}
+		}
+		gIRFrameLock = enable;
+		ADDLOG_INFO(LOG_FEATURE_IR, (char *)"IREnable framelock (interrupts off for the whole frame) set %d", enable);
+		return CMD_RES_OK;
+	}
+
 	if (!my_strnicmp(p, "invert", 6)) {
 		// default normal.
 		enable = 0;
@@ -935,7 +955,7 @@ extern "C" void DRV_IR_Init() {
 			CMD_RegisterCommand("IRAC", IR_AC_Cmd, NULL);
 			#endif //ENABLE_IRAC
 			//cmddetail:{"name":"IREnable","args":"[Str][1or0]",
-			//cmddetail:"descr":"Enable/disable aspects of IR.  IREnable RXTX 0/1 - enable Rx whilst Tx.  IREnable precise 0/1 - time A/C state frames on the 26 MHz timer from the sending task (BK7231, default 1) instead of the 50 us timer interrupt.  IREnable [protocolname] 0/1 - enable/disable a specified protocol",
+			//cmddetail:"descr":"Enable/disable aspects of IR.  IREnable RXTX 0/1 - enable Rx whilst Tx.  IREnable precise 0/1 - time A/C state frames on the 26 MHz timer from the sending task (BK7231, default 1) instead of the 50 us timer interrupt.  IREnable framelock 0/1 - with precise, keep interrupts off for the whole frame (default 1).  IREnable [protocolname] 0/1 - enable/disable a specified protocol",
 			//cmddetail:"fn":"IR_Enable","file":"driver/drv_ir_new.cpp","requires":"ENABLE_DRIVER_IRREMOTEESP (IRremoteESP8266)",
 			//cmddetail:"examples":""}
 			CMD_RegisterCommand("IREnable",IR_Enable, NULL);
