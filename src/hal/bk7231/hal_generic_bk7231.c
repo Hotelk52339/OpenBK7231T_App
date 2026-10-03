@@ -48,6 +48,22 @@ static uint32_t getTicksCount() {
 // 26 ticks per us * 15 000 000 us per overflow
 #define TICKS_PER_OVERFLOW (TICKS_PER_US * US_PER_OVERFLOW)
 
+// The free-running calibration timer for callers that time their own signals
+// (IR send): counts 26 ticks per us and wraps at HAL_GetHWTicksWrap26M().
+// The read is done with interrupts off, as an interrupt handler reading
+// another timer in between would mix up the shared read registers.
+uint32_t HAL_GetHWTicks26M(void) {
+	GLOBAL_INT_DECLARATION();
+	GLOBAL_INT_DISABLE();
+	uint32_t ticks = getTicksCount();
+	GLOBAL_INT_RESTORE();
+	return ticks;
+}
+
+uint32_t HAL_GetHWTicksWrap26M(void) {
+	return TICKS_PER_OVERFLOW;
+}
+
 #endif // #if ! (PLATFORM_BK7252 || PLATFORM_BK7238)
 
 // https://github.com/libretiny-eu/libretiny

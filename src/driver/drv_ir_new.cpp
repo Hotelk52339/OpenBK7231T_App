@@ -194,6 +194,7 @@ public:
 		our_ms = 0;
 		lastduty = 0xFFFFFFFF;
 		hold = 0;
+		precise = 0;
 		resetsendqueue();
 	}
 	~myIRsend() { }
@@ -287,6 +288,8 @@ public:
 	uint32_t lastduty;
 	// set while a frame is being queued: the interrupt starts nothing new
 	volatile uint8_t hold;
+	// set while IR_SendQueuedPrecise() sends: the interrupt leaves the PWM alone
+	volatile uint8_t precise;
 
 	bool busy() {
 		return timein != timeout || currentsendtime != 0;
@@ -301,6 +304,66 @@ public:
 myIRsend *pIRsend = NULL;
 IRrecv *ourReceiver = NULL;
 
+// Sends the queue from the 50 us timer interrupt; returns 1 while sending.
+static inline int IR_SendTick() {
+	int sending = 0;
+	int pinval = 0;
+	if (pIRsend->currentsendtime) {
+		sending = 1;
+		pIRsend->currentsendtime -= ir_period_int;
+		if (pIRsend->currentsendtime <= 0) {
+			int32_t remains = pIRsend->currentsendtime;
+			int32_t newtime = pIRsend->hold ? 0 : pIRsend->getsendqueue();
+			if (0 == newtime) {
+				// if it was the last one
+				pIRsend->currentsendtime = 0;
+				pIRsend->currentbitval = 0;
+			}
+			else {
+				// we got a new time
+				// store mark bits in highest +ve bit of count
+				pIRsend->currentbitval = (newtime & 0x10000000) ? 1 : 0;
+				pIRsend->currentsendtime = (newtime & 0xfffffff);
+				// adjust the us value to keep the running accuracy
+				// and avoid a running error?
+				// note remains is -ve
+				pIRsend->currentsendtime += remains;
+			}
+		}
+	}
+	else {
+		int32_t newtime = pIRsend->hold ? 0 : pIRsend->getsendqueue();
+		if (!newtime) {
+			pIRsend->currentsendtime = 0;
+			pIRsend->currentbitval = 0;
+		}
+		else {
+			sending = 1;
+			pIRsend->currentsendtime = (newtime & 0xfffffff);
+			pIRsend->currentbitval = (newtime & 0x10000000) ? 1 : 0;
+		}
+	}
+	pinval = pIRsend->currentbitval;
+
+	uint32_t duty = pIRsend->pwmduty;
+	if (!pinval) {
+		if (gIRPinPolarity) {
+			duty = 50;
+		}
+		else {
+			duty = 0;
+		}
+	}
+	// Write the PWM only when the level changes, not on every tick:
+	// HAL_PIN_PWM_Update does float maths and reprograms the PWM unit,
+	// which used to happen every 50 us through every mark of a frame.
+	if (duty != pIRsend->lastduty) {
+		pIRsend->lastduty = duty;
+		HAL_PIN_PWM_Update(pIRsend->sendPin, duty);
+	}
+	return sending;
+}
+
 // this is our ISR.
 // it is called every 50us, so we need to work on making it as efficient as possible.
 extern "C" void DRV_IR_ISR(void* arg)
@@ -312,60 +375,12 @@ extern "C" void DRV_IR_ISR(void* arg)
 			pIRsend->our_ms++;
 			pIRsend->our_us -= 1000;
 		}
-
-		int pinval = 0;
-		if (pIRsend->currentsendtime) {
+		if (pIRsend->precise) {
+			// IR_SendQueuedPrecise() sends this frame and drives the PWM itself
 			sending = 1;
-			pIRsend->currentsendtime -= ir_period_int;
-			if (pIRsend->currentsendtime <= 0) {
-				int32_t remains = pIRsend->currentsendtime;
-				int32_t newtime = pIRsend->hold ? 0 : pIRsend->getsendqueue();
-				if (0 == newtime) {
-					// if it was the last one
-					pIRsend->currentsendtime = 0;
-					pIRsend->currentbitval = 0;
-				}
-				else {
-					// we got a new time
-					// store mark bits in highest +ve bit of count
-					pIRsend->currentbitval = (newtime & 0x10000000) ? 1 : 0;
-					pIRsend->currentsendtime = (newtime & 0xfffffff);
-					// adjust the us value to keep the running accuracy
-					// and avoid a running error?
-					// note remains is -ve
-					pIRsend->currentsendtime += remains;
-				}
-			}
 		}
 		else {
-			int32_t newtime = pIRsend->hold ? 0 : pIRsend->getsendqueue();
-			if (!newtime) {
-				pIRsend->currentsendtime = 0;
-				pIRsend->currentbitval = 0;
-			}
-			else {
-				sending = 1;
-				pIRsend->currentsendtime = (newtime & 0xfffffff);
-				pIRsend->currentbitval = (newtime & 0x10000000) ? 1 : 0;
-			}
-		}
-		pinval = pIRsend->currentbitval;
-
-		uint32_t duty = pIRsend->pwmduty;
-		if (!pinval) {
-			if (gIRPinPolarity) {
-				duty = 50;
-			}
-			else {
-				duty = 0;
-			}
-		}
-		// Write the PWM only when the level changes, not on every tick:
-		// HAL_PIN_PWM_Update does float maths and reprograms the PWM unit,
-		// which used to happen every 50 us through every mark of a frame.
-		if (duty != pIRsend->lastduty) {
-			pIRsend->lastduty = duty;
-			HAL_PIN_PWM_Update(pIRsend->sendPin, duty);
+			sending = IR_SendTick();
 		}
 	}
 
@@ -381,6 +396,112 @@ extern "C" void DRV_IR_ISR(void* arg)
 	ir_counter++;
 }
 
+#if PLATFORM_BEKEN && !(PLATFORM_BK7252 || PLATFORM_BK7238)
+#define IR_PRECISE_SEND 1
+extern "C" uint32_t HAL_GetHWTicks26M(void);
+extern "C" uint32_t HAL_GetHWTicksWrap26M(void);
+// FreeRTOS scheduler lock (rtos_suspend_all_thread() is declared by the SDK
+// but not linked in)
+extern "C" void vTaskSuspendAll(void);
+extern "C" long xTaskResumeAll(void);
+#define IR_TICKS_PER_US 26
+// The end of every space is timed with interrupts off; before that they are on.
+#define IR_PRECISE_GUARD_US 300
+// Spaces from this length on (gaps between sections and frames) let other
+// tasks run as well; the last IR_PRECISE_SLEEP_MARGIN_US of them are spun.
+#define IR_PRECISE_SLEEP_FROM_US 6000
+#define IR_PRECISE_SLEEP_MARGIN_US 4000
+#endif
+
+// IREnable precise 0/1: send A/C states with IR_SendQueuedPrecise() (default)
+// or from the 50 us timer interrupt.
+static uint8_t gIRPreciseSend = 1;
+
+#if IR_PRECISE_SEND
+static uint32_t IR_TicksSince(uint32_t from, uint32_t wrap) {
+	uint32_t now = HAL_GetHWTicks26M();
+	return now >= from ? now - from : now + wrap - from;
+}
+
+// Sends the queued frame from the calling task, timing every mark and space on
+// the free-running 26 MHz calibration timer instead of counting 50 us timer
+// interrupts, which any longer interrupt (Wi-Fi) stretches or delays. Marks and
+// the last IR_PRECISE_GUARD_US of every space run with interrupts off, so an
+// edge is never late; the rest of a space lets interrupts in, and long gaps let
+// other tasks run. Trailing spaces only keep the LED dark for their length.
+// Returns the largest delay of an edge in microseconds.
+static uint32_t IR_SendQueuedPrecise() {
+	const uint32_t wrap = HAL_GetHWTicksWrap26M();
+	uint32_t maxLate = 0;
+	uint32_t lastDuty = 0xFFFFFFFF;
+	uint32_t idleDuty = gIRPinPolarity ? 50 : 0;
+	int trailingUs = 0;
+	GLOBAL_INT_DECLARATION();
+
+	pIRsend->precise = 1;
+	vTaskSuspendAll();
+	GLOBAL_INT_DISABLE();
+	uint32_t edge = HAL_GetHWTicks26M();
+	while (pIRsend->timein != pIRsend->timeout) {
+		int32_t v = pIRsend->getsendqueue();
+		bool mark = (v & 0x10000000) != 0;
+		uint32_t us = (uint32_t)(v & 0xfffffff);
+		if (!mark) {
+			// is this space followed by another mark?
+			bool last = true;
+			for (unsigned short i = pIRsend->timeout; i != pIRsend->timein; i = (i + 1) % (SEND_MAXBITS * 2)) {
+				if (pIRsend->times[i] & 0x10000000) {
+					last = false;
+					break;
+				}
+			}
+			if (last) {
+				trailingUs += us;
+				continue;
+			}
+		}
+		uint32_t duty = mark ? pIRsend->pwmduty : idleDuty;
+		if (duty != lastDuty) {
+			lastDuty = duty;
+			HAL_PIN_PWM_Update(pIRsend->sendPin, duty);
+		}
+		uint32_t len = us * IR_TICKS_PER_US;
+		if (!mark && us > IR_PRECISE_GUARD_US) {
+			uint32_t open = (us - IR_PRECISE_GUARD_US) * IR_TICKS_PER_US;
+			GLOBAL_INT_RESTORE();
+			if (us >= IR_PRECISE_SLEEP_FROM_US) {
+				xTaskResumeAll();
+				rtos_delay_milliseconds((us - IR_PRECISE_SLEEP_MARGIN_US) / 1000);
+				vTaskSuspendAll();
+			}
+			while (IR_TicksSince(edge, wrap) < open) {
+			}
+			GLOBAL_INT_DISABLE();
+		}
+		uint32_t waited;
+		while ((waited = IR_TicksSince(edge, wrap)) < len) {
+		}
+		if (waited - len > maxLate) {
+			maxLate = waited - len;
+		}
+		edge += len;
+		if (edge >= wrap) {
+			edge -= wrap;
+		}
+	}
+	if (lastDuty != idleDuty) {
+		HAL_PIN_PWM_Update(pIRsend->sendPin, idleDuty);
+	}
+	GLOBAL_INT_RESTORE();
+	xTaskResumeAll();
+	pIRsend->lastduty = idleDuty;
+	pIRsend->precise = 0;
+	if (trailingUs >= 1000) {
+		rtos_delay_milliseconds(trailingUs / 1000);
+	}
+	return maxLate / IR_TICKS_PER_US;
+}
+#endif
 
 // Sends a protocol whose message is a byte array, as A/C units use
 // (SAMSUNG_AC, MITSUBISHI_AC, DAIKIN, FUJITSU_AC, ...). hex is the state,
@@ -420,6 +541,15 @@ static commandResult_t IR_Send_State(const char *name, decode_type_t protocol, u
 	if (queued) {
 		pIRsend->delay(100);
 	}
+#if IR_PRECISE_SEND
+	if (queued && gIRPreciseSend) {
+		uint32_t late = IR_SendQueuedPrecise();
+		pIRsend->hold = 0;
+		ADDLOG_INFO(LOG_FEATURE_IR, (char *)"IR send %s: protocol %d bits %d (%d bytes), precise, edges late by up to %u us",
+			name, (int)protocol, (int)bits, (int)nbytes, (unsigned)late);
+		return CMD_RES_OK;
+	}
+#endif
 	pIRsend->hold = 0;
 	if (!queued) {
 		ADDLOG_ERROR(LOG_FEATURE_IR, (char *)"IR can't send %s: protocol %d, %d bytes", name, (int)protocol, (int)nbytes);
@@ -587,6 +717,19 @@ extern "C" commandResult_t IR_Enable(const void *context, const char *cmd, const
 		}
 		gEnableIRSendWhilstReceive = enable;
 		ADDLOG_INFO(LOG_FEATURE_IR, (char *)"IREnable RX whilst TX enable set %d", enable);
+		return CMD_RES_OK;
+	}
+
+	if (!my_strnicmp(p, "precise", 7)) {
+		p += 7;
+		if (*p == ' ') {
+			p++;
+			if (*p) {
+				enable = atoi(p);
+			}
+		}
+		gIRPreciseSend = enable;
+		ADDLOG_INFO(LOG_FEATURE_IR, (char *)"IREnable precise A/C state sending set %d", enable);
 		return CMD_RES_OK;
 	}
 
@@ -792,7 +935,7 @@ extern "C" void DRV_IR_Init() {
 			CMD_RegisterCommand("IRAC", IR_AC_Cmd, NULL);
 			#endif //ENABLE_IRAC
 			//cmddetail:{"name":"IREnable","args":"[Str][1or0]",
-			//cmddetail:"descr":"Enable/disable aspects of IR.  IREnable RXTX 0/1 - enable Rx whilst Tx.  IREnable [protocolname] 0/1 - enable/disable a specified protocol",
+			//cmddetail:"descr":"Enable/disable aspects of IR.  IREnable RXTX 0/1 - enable Rx whilst Tx.  IREnable precise 0/1 - time A/C state frames on the 26 MHz timer from the sending task (BK7231, default 1) instead of the 50 us timer interrupt.  IREnable [protocolname] 0/1 - enable/disable a specified protocol",
 			//cmddetail:"fn":"IR_Enable","file":"driver/drv_ir_new.cpp","requires":"ENABLE_DRIVER_IRREMOTEESP (IRremoteESP8266)",
 			//cmddetail:"examples":""}
 			CMD_RegisterCommand("IREnable",IR_Enable, NULL);
