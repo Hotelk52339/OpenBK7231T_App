@@ -123,6 +123,8 @@ extern void IR_ISR(float period_us);
 
 static int8_t ir_chan = -1;
 static float ir_periodus = 50;
+// the same period as an integer, for the send path of the interrupt
+static int ir_period_int = 50;
 
 void timerConfigForReceive() {
 	// nothing here`
@@ -132,6 +134,7 @@ void _timerConfigForReceive() {
 	ir_counter = 0;
 
 	ir_chan = HAL_RequestHWTimer(ir_periodus, &ir_periodus, DRV_IR_ISR, NULL);
+	ir_period_int = (int)(ir_periodus + 0.5f);
 	ADDLOG_INFO(LOG_FEATURE_IR, (char *)"ir timer %u, %.2f us period", ir_chan, ir_periodus);
 }
 
@@ -189,6 +192,8 @@ public:
 		sendPin = aSendPin;
 		our_us = 0;
 		our_ms = 0;
+		lastduty = 0xFFFFFFFF;
+		hold = 0;
 		resetsendqueue();
 	}
 	~myIRsend() { }
@@ -237,10 +242,12 @@ public:
 		//uint_fast8_t aFrequencyKHz
 		if (freq < 1000)  // Were we given kHz? Supports the old call usage.
 			freq *= 1000;
-		ADDLOG_INFO(LOG_FEATURE_IR, (char *)"enableIROut %d freq %d duty",(int)freq, (int)duty);
+		// called again for every section of a frame, while the frame is being sent
+		ADDLOG_DEBUG(LOG_FEATURE_IR, (char *)"enableIROut %d freq %d duty",(int)freq, (int)duty);
 		if(duty<1)
 			duty=1;
 		pwmduty = duty;
+		lastduty = 0xFFFFFFFF; // make the interrupt write the PWM again
 
 		HAL_PIN_PWM_Start(sendPin, freq);
 		//HAL_PIN_PWM_Update(sendPin, duty);
@@ -276,9 +283,17 @@ public:
 
 	uint8_t sendPin;
 	uint32_t pwmduty;
+	// duty last written to the PWM, 0xFFFFFFFF = write it on the next tick
+	uint32_t lastduty;
+	// set while a frame is being queued: the interrupt starts nothing new
+	volatile uint8_t hold;
+
+	bool busy() {
+		return timein != timeout || currentsendtime != 0;
+	}
 
 	uint32_t our_ms;
-	float our_us;
+	int32_t our_us;
 };
 
 
@@ -292,7 +307,7 @@ extern "C" void DRV_IR_ISR(void* arg)
 {
 	int sending = 0;
 	if (pIRsend) {
-		pIRsend->our_us += ir_periodus;
+		pIRsend->our_us += ir_period_int;
 		if (pIRsend->our_us > 1000) {
 			pIRsend->our_ms++;
 			pIRsend->our_us -= 1000;
@@ -301,10 +316,10 @@ extern "C" void DRV_IR_ISR(void* arg)
 		int pinval = 0;
 		if (pIRsend->currentsendtime) {
 			sending = 1;
-			pIRsend->currentsendtime -= ir_periodus;
+			pIRsend->currentsendtime -= ir_period_int;
 			if (pIRsend->currentsendtime <= 0) {
 				int32_t remains = pIRsend->currentsendtime;
-				int32_t newtime = pIRsend->getsendqueue();
+				int32_t newtime = pIRsend->hold ? 0 : pIRsend->getsendqueue();
 				if (0 == newtime) {
 					// if it was the last one
 					pIRsend->currentsendtime = 0;
@@ -323,7 +338,7 @@ extern "C" void DRV_IR_ISR(void* arg)
 			}
 		}
 		else {
-			int32_t newtime = pIRsend->getsendqueue();
+			int32_t newtime = pIRsend->hold ? 0 : pIRsend->getsendqueue();
 			if (!newtime) {
 				pIRsend->currentsendtime = 0;
 				pIRsend->currentbitval = 0;
@@ -345,7 +360,13 @@ extern "C" void DRV_IR_ISR(void* arg)
 				duty = 0;
 			}
 		}
-		HAL_PIN_PWM_Update(pIRsend->sendPin, duty);
+		// Write the PWM only when the level changes, not on every tick:
+		// HAL_PIN_PWM_Update does float maths and reprograms the PWM unit,
+		// which used to happen every 50 us through every mark of a frame.
+		if (duty != pIRsend->lastduty) {
+			pIRsend->lastduty = duty;
+			HAL_PIN_PWM_Update(pIRsend->sendPin, duty);
+		}
 	}
 
 	// is someone really wants rx and TX at the same time, then allow it.
@@ -388,11 +409,27 @@ static commandResult_t IR_Send_State(const char *name, decode_type_t protocol, u
 		ADDLOG_INFO(LOG_FEATURE_IR, (char *)"IR NOT send (no IRsend running) %s", name);
 		return CMD_RES_ERROR;
 	}
-	if (!pIRsend->send(protocol, state, nbytes)) {
+	// One frame at a time: let an earlier one finish first.
+	for (int waited = 0; pIRsend->busy() && waited < 3000; waited += 10) {
+		rtos_delay_milliseconds(10);
+	}
+	// Queue the whole frame before the interrupt starts sending it, so a
+	// preempted sender cannot leave a gap inside the frame.
+	pIRsend->hold = 1;
+	bool queued = pIRsend->send(protocol, state, nbytes);
+	if (queued) {
+		pIRsend->delay(100);
+	}
+	pIRsend->hold = 0;
+	if (!queued) {
 		ADDLOG_ERROR(LOG_FEATURE_IR, (char *)"IR can't send %s: protocol %d, %d bytes", name, (int)protocol, (int)nbytes);
 		return CMD_RES_BAD_ARGUMENT;
 	}
-	pIRsend->delay(100);
+	// Answer only after the frame has left the LED: the reply to this command
+	// is Wi-Fi traffic, and none of it should run while the frame is timed.
+	for (int waited = 0; pIRsend->busy() && waited < 3000; waited += 10) {
+		rtos_delay_milliseconds(10);
+	}
 	ADDLOG_INFO(LOG_FEATURE_IR, (char *)"IR send %s: protocol %d bits %d (%d bytes)", name, (int)protocol, (int)bits, (int)nbytes);
 	return CMD_RES_OK;
 }
